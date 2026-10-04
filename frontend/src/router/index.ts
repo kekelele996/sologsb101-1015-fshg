@@ -11,6 +11,7 @@ export const ROUTES = {
   measures: '/measures',
   supports: '/supports',
   reviews: '/reviews',
+  sync: '/sync',
 } as const
 
 const routes: RouteRecordRaw[] = [
@@ -44,6 +45,12 @@ const routes: RouteRecordRaw[] = [
     name: 'review-view',
     component: () => import('@/pages/ReviewView.vue'),
     meta: { title: '长势复评与结构版本' },
+  },
+  {
+    path: '/sync',
+    name: 'sync-center',
+    component: () => import('@/pages/SyncCenter.vue'),
+    meta: { title: '离线同步与对账' },
   },
   { path: '/:pathMatch(.*)*', redirect: ROUTES.trees },
 ]
