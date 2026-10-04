@@ -1,14 +1,16 @@
 /**
  * 树体检查（Survey）
  * 每次检查记录树高、胸径、冠幅、倾斜度、空洞数与立地状况。
+ * 平板离线记巡查单，回办公室交巡查包，档案室按两边各自来历对账。
  */
+import type { SyncFields } from './sync'
 
 /** 立地状况：铺装 / 裸土 / 积水 */
 export type SiteNote = '铺装' | '裸土' | '积水'
 
 export const SITE_NOTE_OPTIONS: SiteNote[] = ['铺装', '裸土', '积水']
 
-export interface Survey {
+export interface Survey extends SyncFields {
   id: string
   /** 所属古树 */
   treeId: string
@@ -31,7 +33,7 @@ export interface Survey {
   revision: number
 }
 
-/** 新建 / 编辑树体检查的表单草稿 */
+/** 新建 / 编辑树体检查（巡查单）的表单草稿 */
 export interface SurveyDraft {
   treeId: string
   date: string
@@ -41,4 +43,6 @@ export interface SurveyDraft {
   leanDeg: number
   hollowCount: number
   siteNote: SiteNote
+  /** 登记人（旧单按登记人补一方） */
+  registrar: string
 }

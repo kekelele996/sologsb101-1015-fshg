@@ -14,6 +14,7 @@ import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useTreeStore } from '@/stores/treeStore'
 import { db } from '@/utils/db'
 import { SITE_NOTE_OPTIONS, type SiteNote, type Survey, type SurveyDraft } from '@/types/survey'
+import { ARCHIVE_REGISTRARS } from '@/stores/syncStore'
 import { LEAN_DANGER_DEG, LEAN_WATCH_DEG, annualGrowth, hollowRisk, leanLevel, siteAdvice } from '@/utils/dimension'
 
 const route = useRoute()
@@ -39,6 +40,7 @@ const form = reactive<SurveyDraft>({
   leanDeg: 2,
   hollowCount: 0,
   siteNote: '裸土',
+  registrar: '陈静',
 })
 
 const rules: FormRules<SurveyDraft> = {
@@ -105,6 +107,7 @@ function openCreate(): void {
     leanDeg: latest.value === null ? 2 : latest.value.leanDeg,
     hollowCount: latest.value === null ? 0 : latest.value.hollowCount,
     siteNote: latest.value === null ? ('裸土' as SiteNote) : latest.value.siteNote,
+    registrar: ARCHIVE_REGISTRARS[0],
   })
   dialogVisible.value = true
 }
@@ -120,6 +123,7 @@ function openEdit(row: Survey): void {
     leanDeg: row.leanDeg,
     hollowCount: row.hollowCount,
     siteNote: row.siteNote,
+    registrar: row.registrar || ARCHIVE_REGISTRARS[0],
   })
   dialogVisible.value = true
 }
@@ -131,7 +135,17 @@ async function handleSubmit(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value === null) {
-      await create({ ...form }, 'survey')
+      await create(
+        {
+          ...form,
+          origin: 'archive',
+          version: 1,
+          tombstone: false,
+          syncState: 'synced',
+          lastSyncedVersion: 1,
+        },
+        'survey',
+      )
       ElMessage.success('树体检查记录已登记')
     } else {
       await update(editingId.value, { ...form })
@@ -368,6 +382,11 @@ async function handleDelete(row: Survey): Promise<void> {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item label="登记人" prop="registrar">
+          <el-select v-model="form.registrar" filterable allow-create style="width: 100%">
+            <el-option v-for="r in ARCHIVE_REGISTRARS" :key="r" :value="r" :label="r" />
+          </el-select>
+        </el-form-item>
         <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="树高（m）" prop="heightM">

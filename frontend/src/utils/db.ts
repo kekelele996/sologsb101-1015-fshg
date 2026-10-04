@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbheritagetree
- * - 含数据结构版本号与 v1 → v2 升级迁移逻辑（升级时按 version().stores() 补齐索引）
+ * - 含数据结构版本号与 v1 → v2 → v3 升级迁移逻辑
+ * - v3：巡查单加来历 / 登记人 / 版本 / 墓碑 / 对账状态；新增巡查包、冲突、墓碑表
  * - 提供各表增删改查、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -11,6 +12,7 @@ import type { Survey } from '../types/survey'
 import type { Measure, MeasureState } from '../types/measure'
 import type { Support } from '../types/support'
 import type { Review } from '../types/review'
+import type { SyncConflict, SyncPackage, SyncTombstone } from '../types/sync'
 import { nowIso, today } from './id'
 import { seedDatabase } from './seed'
 
@@ -18,10 +20,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbheritagetree'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class HeritageTreeDatabase extends Dexie {
   trees!: Table<Tree, string>
@@ -29,6 +31,14 @@ class HeritageTreeDatabase extends Dexie {
   measures!: Table<Measure, string>
   supports!: Table<Support, string>
   reviews!: Table<Review, string>
+  /** 档案室：平板交来的巡查单（待对账） */
+  transferredForms!: Table<Survey, string>
+  /** 两边都改过的冲突（留两版等人定） */
+  syncConflicts!: Table<SyncConflict, string>
+  /** 撤掉的树要留标记（墓碑） */
+  syncTombstones!: Table<SyncTombstone, string>
+  /** 巡查包：平板回办公室交的一包巡查单 */
+  syncPackages!: Table<SyncPackage, string>
 
   constructor() {
     super(DB_NAME)
@@ -43,7 +53,7 @@ class HeritageTreeDatabase extends Dexie {
     })
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         trees: 'id, code, species, protectLevel, ageYears, createdAt, updatedAt, owner',
         // 复合索引 [treeId+date]：按古树 + 日期快速取检查记录
@@ -80,6 +90,36 @@ class HeritageTreeDatabase extends Dexie {
         await tx.table('supports').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.lastCheckDate !== 'string') row.lastCheckDate = ''
           if (typeof row.checkCycleMon !== 'number') row.checkCycleMon = 12
+        })
+      })
+
+    // ---------- v3：巡查单加来历 / 登记人 / 版本 / 墓碑 / 对账状态，新增对账表 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        trees: 'id, code, species, protectLevel, ageYears, createdAt, updatedAt, owner',
+        surveys: 'id, treeId, [treeId+date], date, siteNote, origin, syncState, registrar',
+        measures: 'id, treeId, type, state, date, operator',
+        supports: 'id, treeId, type, installDate, lastCheckDate',
+        reviews: 'id, treeId, date, vigor, trend',
+        transferredForms: 'id, treeId, origin, syncState, date',
+        syncConflicts: 'id, treeId, formId, status',
+        syncTombstones: 'treeId, removedAt',
+        syncPackages: 'id, status, createdAt',
+      })
+      .upgrade(async (tx) => {
+        // 旧巡查单没来历：升级时按登记人补一方，老单只归档不对账
+        const tabletOfficers = new Set(['张磊', '王芳', '李强'])
+        await tx.table('surveys').toCollection().modify((row: Record<string, unknown>) => {
+          const registrar = typeof row.registrar === 'string' ? row.registrar : ''
+          const hasRegistrar = registrar.trim() !== ''
+          // 按登记人补一方：登记人是平板巡查班的归平板，否则归档案室
+          const origin = hasRegistrar ? (tabletOfficers.has(registrar) ? 'tablet' : 'archive') : 'legacy'
+          row.origin = origin
+          row.registrar = registrar
+          row.version = 1
+          row.tombstone = false
+          row.syncState = 'archived-legacy' // 老单只归档不对账
+          row.lastSyncedVersion = 1
         })
       })
   }
@@ -251,60 +291,168 @@ export interface DatabaseSnapshot {
   measures: Measure[]
   supports: Support[]
   reviews: Review[]
+  transferredForms?: Survey[]
+  syncConflicts?: SyncConflict[]
+  syncTombstones?: SyncTombstone[]
+  syncPackages?: SyncPackage[]
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [trees, surveys, measures, supports, reviews] = await Promise.all([
-    db.trees.toArray(),
-    db.surveys.toArray(),
-    db.measures.toArray(),
-    db.supports.toArray(),
-    db.reviews.toArray(),
-  ])
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), trees, surveys, measures, supports, reviews }
+  const [trees, surveys, measures, supports, reviews, transferredForms, syncConflicts, syncTombstones, syncPackages] =
+    await Promise.all([
+      db.trees.toArray(),
+      db.surveys.toArray(),
+      db.measures.toArray(),
+      db.supports.toArray(),
+      db.reviews.toArray(),
+      db.transferredForms.toArray(),
+      db.syncConflicts.toArray(),
+      db.syncTombstones.toArray(),
+      db.syncPackages.toArray(),
+    ])
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    trees,
+    surveys,
+    measures,
+    supports,
+    reviews,
+    transferredForms,
+    syncConflicts,
+    syncTombstones,
+    syncPackages,
+  }
 }
 
 /** 用快照覆盖整库（导入存档） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await Promise.all([
-      db.trees.clear(),
-      db.surveys.clear(),
-      db.measures.clear(),
-      db.supports.clear(),
-      db.reviews.clear(),
-    ])
-    await db.trees.bulkPut(snapshot.trees.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.measures.bulkPut(snapshot.measures.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.supports.bulkPut(snapshot.supports.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.reviews.bulkPut(snapshot.reviews.map((row) => ({ ...row, revision: ROW_REVISION })))
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.trees,
+      db.surveys,
+      db.measures,
+      db.supports,
+      db.reviews,
+      db.transferredForms,
+      db.syncConflicts,
+      db.syncTombstones,
+      db.syncPackages,
+    ],
+    async () => {
+      await Promise.all([
+        db.trees.clear(),
+        db.surveys.clear(),
+        db.measures.clear(),
+        db.supports.clear(),
+        db.reviews.clear(),
+        db.transferredForms.clear(),
+        db.syncConflicts.clear(),
+        db.syncTombstones.clear(),
+        db.syncPackages.clear(),
+      ])
+      await db.trees.bulkPut(snapshot.trees.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.measures.bulkPut(snapshot.measures.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.supports.bulkPut(snapshot.supports.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.reviews.bulkPut(snapshot.reviews.map((row) => ({ ...row, revision: ROW_REVISION })))
+      if (snapshot.transferredForms) await db.transferredForms.bulkPut(snapshot.transferredForms)
+      if (snapshot.syncConflicts) await db.syncConflicts.bulkPut(snapshot.syncConflicts)
+      if (snapshot.syncTombstones) await db.syncTombstones.bulkPut(snapshot.syncTombstones)
+      if (snapshot.syncPackages) await db.syncPackages.bulkPut(snapshot.syncPackages)
+    },
+  )
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await Promise.all([
-      db.trees.clear(),
-      db.surveys.clear(),
-      db.measures.clear(),
-      db.supports.clear(),
-      db.reviews.clear(),
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.trees,
+      db.surveys,
+      db.measures,
+      db.supports,
+      db.reviews,
+      db.transferredForms,
+      db.syncConflicts,
+      db.syncTombstones,
+      db.syncPackages,
+    ],
+    async () => {
+      await Promise.all([
+        db.trees.clear(),
+        db.surveys.clear(),
+        db.measures.clear(),
+        db.supports.clear(),
+        db.reviews.clear(),
+        db.transferredForms.clear(),
+        db.syncConflicts.clear(),
+        db.syncTombstones.clear(),
+        db.syncPackages.clear(),
+      ])
+    },
+  )
   await seedDatabase()
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [trees, surveys, measures, supports, reviews] = await Promise.all([
-    db.trees.count(),
-    db.surveys.count(),
-    db.measures.count(),
-    db.supports.count(),
-    db.reviews.count(),
-  ])
-  return { trees, surveys, measures, supports, reviews }
+  const [trees, surveys, measures, supports, reviews, transferredForms, syncConflicts, syncTombstones, syncPackages] =
+    await Promise.all([
+      db.trees.count(),
+      db.surveys.count(),
+      db.measures.count(),
+      db.supports.count(),
+      db.reviews.count(),
+      db.transferredForms.count(),
+      db.syncConflicts.count(),
+      db.syncTombstones.count(),
+      db.syncPackages.count(),
+    ])
+  return { trees, surveys, measures, supports, reviews, transferredForms, syncConflicts, syncTombstones, syncPackages }
+}
+
+/* ---------------------------- 对账表操作 ---------------------------- */
+
+/** 撤掉古树：写墓碑标记（不物理删除，留标记） */
+export async function addTombstone(treeId: string, reason: string): Promise<void> {
+  await db.syncTombstones.put({ treeId, removedAt: nowIso(), reason })
+}
+
+/** 古树是否已被撤掉（撞墓碑：巡查包里再冒出同一株不能带回来） */
+export async function isTombstoned(treeId: string): Promise<boolean> {
+  const row = await db.syncTombstones.get(treeId)
+  return row !== undefined
+}
+
+/** 列出全部墓碑 */
+export async function listTombstones(): Promise<SyncTombstone[]> {
+  return db.syncTombstones.toArray()
+}
+
+/** 列出未解决的冲突 */
+export async function listPendingConflicts(): Promise<SyncConflict[]> {
+  return db.syncConflicts.where('status').equals('pending').toArray()
+}
+
+/** 列出全部巡查包（按创建时间倒序） */
+export async function listPackages(): Promise<SyncPackage[]> {
+  const rows = await db.syncPackages.toArray()
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+}
+
+/** 档案室复核修正巡查单：版本 +1，origin 标记为档案室 */
+export async function archiveReviewSurvey(row: Survey): Promise<void> {
+  await db.surveys.put({
+    ...row,
+    origin: 'archive',
+    version: row.version + 1,
+    lastSyncedVersion: row.lastSyncedVersion,
+    updatedAt: nowIso(),
+    revision: ROW_REVISION,
+  })
 }

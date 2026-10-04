@@ -89,6 +89,7 @@ sologsb101-1015/
 | `/measures` | `pages/MeasureBoard.vue` | 复壮措施台账：按类型与实施状态筛选、行内草稿、批量改状态，完成即回写最近复壮日期 |
 | `/supports` | `pages/SupportBoard.vue` | 支撑加固与避雷件登记：超周期未检查自动高亮 + 顶部提醒 + 一键登记本次检查 |
 | `/reviews` | `pages/ReviewView.vue` | 长势复评与结构版本：衰弱/濒危强制填写后续措施、历史时间线、JSON 导入导出 |
+| `/sync` | `pages/SyncBoard.vue` | 巡查对账：平板离线记巡查单、回办公室交巡查包、档案室按来历对账、冲突两版等人定、墓碑标记、断点续传、旧单归档 |
 
 `/` 重定向到 `/trees`，未匹配路径统一回落到 `/trees`。
 **层级路由支持直接深链**：把 `http://localhost:22815/trees/tree-guozijian-0007/surveys` 直接粘贴到地址栏即可打开；
@@ -99,27 +100,35 @@ sologsb101-1015/
 ## 五、数据存储说明
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
-* **数据库名**：`gbheritagetree`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * `surveys` 增加 `[treeId+date]` 复合索引、`measures` 增加 `operator` 索引、`supports` 增加 `lastCheckDate` 索引、`reviews` 增加 `trend` 索引；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `trees` 补齐 `lastMeasureDate`（最近复壮日期）回写字段；
-  * 为 `reviews` 补齐 `followUp`（后续措施）字段；
-  * 为 `supports` 补齐 `lastCheckDate` 与 `checkCycleMon` 缺省值。
+* **数据库名**：`gbheritagetree`（档案室库）；平板离线库为独立的 `gbheritagetree-tablet`（`src/utils/sync/tabletDb.ts`），物理隔离，山上没信号也能离线记巡查单。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，`version(3)` 为巡查单加来历 / 登记人 / 版本 / 墓碑 / 对账状态并新增对账表：
+  * `surveys` 增加 `origin`（tablet/archive/legacy）、`registrar`（登记人）、`version`（单调版本号）、`tombstone`（墓碑标记）、`syncState`（对账状态）、`lastSyncedVersion`（上次认下版本）；
+  * 旧巡查单没来历：升级时按登记人补一方（平板巡查班归平板，否则归档案室），老单只归档不对账（`syncState = 'archived-legacy'`）；
+  * 新增 `transferredForms`（平板交来的巡查单）、`syncConflicts`（两边都改过的冲突）、`syncTombstones`（撤掉的树留标记）、`syncPackages`（巡查包传输状态）四张对账表。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `trees` | id | code, species, protectLevel, ageYears, createdAt, updatedAt, owner |
-  | `surveys` | id | treeId, [treeId+date], date, siteNote |
+  | `surveys` | id | treeId, [treeId+date], date, siteNote, origin, syncState, registrar |
   | `measures` | id | treeId, type, state, date, operator |
   | `supports` | id | treeId, type, installDate, lastCheckDate |
   | `reviews` | id | treeId, date, vigor, trend |
+  | `transferredForms` | id | treeId, origin, syncState, date |
+  | `syncConflicts` | id | treeId, formId, status |
+  | `syncTombstones` | treeId | removedAt |
+  | `syncPackages` | id | status, createdAt |
 
+* **对账引擎**（`src/utils/sync/engine.ts`，纯函数）：档案室按两边各自来历对账——
+  * 同一条认各自最新版（LWW per side）：版本号大的留下；
+  * 两边都改过的树先留两版等人定（conflict）：平板和档案室都改过同一条且都比「上次认下的版本」新，就把两版都留下等人工裁定；
+  * 撤掉的树要留标记（tombstone）：巡查包里再冒出同一株不能带回来；
+  * 旧巡查单没来历（legacy）：只归档不对账。
+* **断点续传**：巡查包逐条传到档案室库，`ackedItems` 记录已传条目；传一半失败后按那头重试，已认下那头不受影响，网络恢复后接着传。
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `trees` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **古树 → 树体检查 / 复壮措施 / 加固件 / 长势复评** 三层互相引用：
   * 3 株古树（京-01-0007 国槐 一级 / 京-02-0113 银杏 一级 / 京-05-0246 侧柏 二级）；
-  * 9 条树体检查（每株 3 次，树高胸径随日期递增）、8 条复壮措施（覆盖计划 / 实施中 / 已完成）、
+  * 9 条树体检查（每株 3 次，数值随日期递增，登记人覆盖平板巡查班与档案室，用于演示「按登记人补一方」）、8 条复壮措施（覆盖计划 / 实施中 / 已完成）、
     5 件加固件（其中 **京-01-0007 支撑杆** 与 **京-05-0246 避雷** 故意超周期未检查，用于验证高亮与提醒）、
     7 条长势复评（含衰弱 / 濒危样本且均已填写后续措施）。
   * 固定 id 如 `tree-guozijian-0007`、`tree-xiangshan-0113`、`tree-ritan-0246` 可直接用于深链验证。
